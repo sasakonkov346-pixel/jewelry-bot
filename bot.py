@@ -54,7 +54,7 @@ STYLE = """Ты — личный ассистент, менеджер и раб�
 - Если просят пост про изделие, а фото не приложено, напомни, что нужно фото.
 """
 TOOLS = """
-Инструменты. Чтобы вызвать, ответь ОДНОЙ строкой, без другого текста:
+Инструменты. Чтобы вызвать, ответь только строками вызова, без пояснений до и после. Можно до 3 вызовов подряд, каждый на своей строке:
 SEARCH: поисковый запрос
 PAGE: https://адрес-страницы
 CHANNEL: @имя_публичного_канала
@@ -106,7 +106,7 @@ async def tool_page(url: str) -> str:
             r = await c.get(url)
         soup = BeautifulSoup(r.text, "html.parser")
         for t in soup(["script", "style", "nav", "footer", "header"]): t.decompose()
-        return re.sub(r"\s+", " ", soup.get_text(" "))[:6000] or "пусто"
+        return re.sub(r"\s+", " ", soup.get_text(" "))[:4000] or "пусто"
     except Exception as e: return f"ошибка загрузки: {e}"
 
 async def tool_channel(name: str) -> str:
@@ -127,18 +127,23 @@ async def tool_channel(name: str) -> str:
 
 TOOL_FN = {"SEARCH": tool_search, "PAGE": tool_page, "CHANNEL": tool_channel}
 
+TOOL_RE = re.compile(r"^\s*(SEARCH|PAGE|CHANNEL):\s*(\S.*?)\s*$", re.M)
+
 async def agent(user_text: str, history=None, max_steps=6) -> str:
     msgs = [{"role": "system", "content": system_prompt()}] + (history or []) + [{"role": "user", "content": user_text}]
     for _ in range(max_steps):
         out = await llm(msgs)
-        m = re.match(r"^\s*(SEARCH|PAGE|CHANNEL):\s*(.+)", out)
-        if not m: return out
-        kind, arg = m.group(1), m.group(2).strip().splitlines()[0]
-        log.info("tool %s %s", kind, arg)
-        res = await TOOL_FN[kind](arg)
-        msgs += [{"role": "assistant", "content": out}, {"role": "user", "content": f"Результат {kind} «{arg}»:\n{res}"}]
+        calls = TOOL_RE.findall(out)[:3]
+        if not calls:
+            return out
+        results = []
+        for kind, arg in calls:
+            log.info("tool %s %s", kind, arg)
+            results.append(f"Результат {kind} «{arg}»:\n{await TOOL_FN[kind](arg)}")
+        msgs += [{"role": "assistant", "content": out}, {"role": "user", "content": "\n\n".join(results)}]
     msgs.append({"role": "user", "content": "Поиск окончен. Дай итоговый ответ сейчас, без вызова инструментов."})
-    return await llm(msgs)
+    out = await llm(msgs)
+    return TOOL_RE.sub("", out).strip() or "Не удалось собрать данные, попробуй уточнить запрос."
 
 # ---------------------------------------------------------------- Telegram
 bot = Bot(TOKEN) if TOKEN else None
