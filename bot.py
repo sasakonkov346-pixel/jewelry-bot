@@ -37,9 +37,11 @@ create table if not exists drafts(id integer primary key autoincrement, text tex
 db.commit()
 
 # ---------------------------------------------------------------- системный промпт
-STYLE = """Ты — личный ассистент, менеджер и работник владельца ювелирного бизнеса (Александр). Отвечай по-русски, по делу, без воды и без лести. Говори прямо, в том числе когда новости плохие.
+STYLE = """Ты — личный ассистент владельца ювелирного бизнеса (Александр) и совмещаешь четыре роли: менеджер, маркетолог, копирайтер, аналитик. Ведёшь себя как толковый живой сотрудник, а не как чат-бот. Отвечай по-русски, по делу, без воды и без лести. Говори прямо, в том числе когда новости плохие.
 
-Задачи: анализ открытых источников, посты для Telegram-канала, аналитические справки по бизнесу, обсуждение решений.
+Как работает менеджер: в конце рабочих ответов предлагай конкретный следующий шаг (одно действие). Задавай не больше одного уточняющего вопроса и только если без ответа нельзя продолжить, иначе делай разумное допущение и пометь его. Если видишь риск (сроки, маржа, юридический момент, слабая идея) — скажи об этом первым.
+
+Как работает маркетолог: опирайся на раздел «Маркетинг» из контекста бизнеса. Думай воронкой: канал/Авито → личка → консультация → эскиз → предоплата → заказ. Любое предложение привязывай к цели (просмотры, заявки, чек) и к тому, как это измерить.
 
 Правила анализа:
 - Любую цифру (цену, вес, карат) приводи только если видел её в тексте открытой страницы или в выдаче поиска, и пиши, откуда именно. Если страница не открылась (маркетплейсы часто блокируют) или цены в тексте нет — прямо так и напиши, не подставляй «примерные» значения.
@@ -52,8 +54,9 @@ STYLE = """Ты — личный ассистент, менеджер и раб�
 - Тон: премиальный, спокойный, живой, без перегруза. Короткие абзацы. Только обычный текст, без markdown-разметки.
 - Пост про изделие: полные характеристики (металл и проба, вес, вставка: тип, размер, караты, огранка, размер изделия), примерная цена («от … ₽»), как заказать (написать в личные сообщения). Данные, которых нет, помечай «[уточнить]», не придумывай.
 - Муассанит и лабораторные бриллианты называй честно, не выдавай за природные алмазы.
-- Текст поста выдавай ТОЛЬКО между метками <POST> и </POST>. Вне меток — максимум одна короткая реплика.
+- Текст поста выдавай ТОЛЬКО между метками <POST> и </POST>. Вне меток — короткая реплика и блок «Визуал:».
 - Если просят пост про изделие, а фото не приложено, напомни, что нужно фото.
+- После поста (вне меток) дай блок «Визуал:» в 2–3 строках: что в кадре, цветовая гамма, какой короткий текст поместить на картинку. Это задание для дизайнера или для Canva.
 """
 TOOLS = """
 Инструменты. Чтобы вызвать, ответь только строками вызова, без пояснений до и после. Можно до 3 вызовов подряд, каждый на своей строке:
@@ -129,23 +132,29 @@ async def tool_channel(name: str) -> str:
 
 TOOL_FN = {"SEARCH": tool_search, "PAGE": tool_page, "CHANNEL": tool_channel}
 
+def clean(t: str) -> str:
+    t = re.sub(r"<think>.*?</think>", "", t, flags=re.S)
+    if "</think>" in t: t = t.split("</think>")[-1]
+    return t.strip()
+
 TOOL_RE = re.compile(r"^\s*(SEARCH|PAGE|CHANNEL):\s*(\S.*?)\s*$", re.M)
 
 async def agent(user_text: str, history=None, max_steps=6) -> str:
     msgs = [{"role": "system", "content": system_prompt()}] + (history or []) + [{"role": "user", "content": user_text}]
     for _ in range(max_steps):
         out = await llm(msgs)
-        calls = TOOL_RE.findall(out)[:3]
+        calls = TOOL_RE.findall(out.split("</think>")[0])[:3]
         if not calls:
-            return out
+            return clean(out)
         results = []
         for kind, arg in calls:
+            if kind != "SEARCH": arg = arg.split()[0]
             log.info("tool %s %s", kind, arg)
             results.append(f"Результат {kind} «{arg}»:\n{await TOOL_FN[kind](arg)}")
         msgs += [{"role": "assistant", "content": out}, {"role": "user", "content": "\n\n".join(results)}]
     msgs.append({"role": "user", "content": "Поиск окончен. Дай итоговый ответ сейчас, без вызова инструментов."})
     out = await llm(msgs)
-    return TOOL_RE.sub("", out).strip() or "Не удалось собрать данные, попробуй уточнить запрос."
+    return TOOL_RE.sub("", clean(out)).strip() or "Не удалось собрать данные, попробуй уточнить запрос."
 
 # ---------------------------------------------------------------- Telegram
 bot = Bot(TOKEN) if TOKEN else None
@@ -339,10 +348,19 @@ async def on_text(m: Message):
         return await create_task(text, m)
     await respond(text)
 
+def seed_tasks():
+    f = BASE / "tasks_seed.json"
+    if f.exists() and db.execute("select count(*) from tasks").fetchone()[0] == 0:
+        for t in json.loads(f.read_text(encoding="utf-8")):
+            db.execute("insert into tasks(title,cron,prompt) values(?,?,?)", (t["title"], t["cron"], t["prompt"]))
+        db.commit()
+        log.info("Стартовые задачи созданы из tasks_seed.json")
+
 # ---------------------------------------------------------------- запуск
 async def main():
     if not TOKEN: raise SystemExit("Заполни TELEGRAM_BOT_TOKEN в файле .env")
     dp.include_router(public); dp.include_router(router)
+    seed_tasks()
     for tid, cron in db.execute("select id,cron from tasks where enabled=1").fetchall():
         try: schedule_job(tid, cron)
         except Exception as e: log.warning("task %s: %s", tid, e)
